@@ -1,0 +1,10 @@
+[package]
+name = "matriochka"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+runtime-context = "0.1.1"
+
+[dev-dependencies]
+thiserror = "2"
