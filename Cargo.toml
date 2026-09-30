@@ -2,6 +2,14 @@
 name = "matriochka"
 version = "0.1.0"
 edition = "2024"
+authors = ["Slixe <slixeprivate@gmail.com>"]
+description = "Error wrapping and aggregation with typed runtime context and diagnostic chains"
+license = "MIT"
+keywords = ["error", "error-handling", "context", "aggregation", "diagnostics"]
+
+repository = "https://github.com/xelis-project/matriochka"
+homepage = "https://github.com/xelis-project/matriochka"
+readme = "README.md"
 
 [dependencies]
 runtime-context = "0.1.3"
