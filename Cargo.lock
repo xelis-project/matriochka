@@ -36,9 +36,9 @@ dependencies = [
 
 [[package]]
 name = "runtime-context"
-version = "0.1.1"
+version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fa46a7a866801bd66270c061c17122d82935989e6b23bd74948a14063812cc66"
+checksum = "0707888d36cb1465bd4036a6098c6621c8be08fc2d27157eea262cd9d5a16a03"
 dependencies = [
  "better_any",
 ]

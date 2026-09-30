@@ -8,9 +8,9 @@ retrieving a typed input error to select the response at the boundary.
 use matriochka::{Error, ResultExt};
 
 #[derive(Debug, thiserror::Error)]
-enum InputError {
-    #[error("account {0} does not exist")]
-    AccountNotFound(u64),
+enum ErrorKind {
+    #[error("account does not exist")]
+    NotFound,
     #[error("service unavailable")]
     Unavailable,
 }
@@ -20,21 +20,22 @@ fn load_account(id: u64) -> Result<String, Error> {
         .with_input_error(|err| {
             match err.downcast_ref::<std::io::Error>() {
                 Some(error) if error.kind() == std::io::ErrorKind::NotFound =>
-                    InputError::AccountNotFound(id),
-                _ => InputError::Unavailable,
+                    ErrorKind::NotFound,
+                _ => ErrorKind::Unavailable,
             }
         })
-        .with_context(|| format!("loading account {id}"))
 }
 
 fn rpc_account(id: u64) -> Result<String, Error> {
-    load_account(id).context("handling account RPC")
+    load_account(id).with_context(|| format!("loading account {id}"))
 }
 
 if let Err(err) = rpc_account(42) {
     // Inspect the user-defined enum to select an RPC response.
-    let input = err.input_error::<InputError>();
+    // This can be used to correctly return a 404 or 503 response, for example.
+    let _input = err.input_error::<ErrorKind>().expect("input error is always present");
     // Display every annotated level and the original error sources.
+    // Output: "loading account 42: account does not exist"
     eprintln!("{err:#}");
 }
 ```
@@ -48,22 +49,23 @@ Input errors live in [`runtime-context`](https://github.com/xelis-project/runtim
 as `matriochka::InputError<T>`. The runtime context is initialized on first write.
 `with_input_error` runs only on failure and only if that type is absent, including
 from visible `Error` sources. `set_input_error` explicitly replaces a value at
-the current boundary. Different input-error types coexist; the nearest value of
-a requested type wins. `data()` and `data_mut()` expose the runtime context for
+the aggregate. Different input-error types coexist. Joining keeps the first value
+of each type; wrapping keeps existing values over incoming duplicates. `data()` and `data_mut()` expose the runtime context for
 additional typed metadata. No global or thread-local state is used.
 
 `input_error_mut::<T>()` edits an existing value at the current boundary without
 allocating. To insert a value if needed and get a mutable reference, use
 `get_or_insert_input_error(value)`, `get_or_insert_input_error_with(|| value)`,
 or `get_or_insert_input_error_default::<T>()`. Factories and defaults run only
-when a mutable local value is missing.
+when this type has no local entry.
 
-These mutable helpers operate on the current error's metadata, just like
-`set_input_error`. They do not traverse source errors or joined branches, since
-standard error sources only expose shared references. Inserting a local value
-overrides inherited lookup results without changing the child errors. Immutable
-borrowed entries inserted through `data_mut()` are replaced with owned values
-by the insertion helpers.
+These mutable helpers operate on the aggregate context, including metadata moved
+from joined or wrapped Matriochka errors. Third-party errors expose only shared
+sources, so metadata hidden inside those sources cannot be moved into the
+aggregate; immutable input-error lookup still searches them as a fallback. Immutable
+borrowed entries inserted through `data_mut()` cause the insertion helpers to
+panic without calling the factory or default. Use `set_input_error` to explicitly
+replace such an entry.
 
 `with_context` builds its context only on failure. Context values retain their
 types without eager formatting, and successful results allocate no storage in
@@ -73,8 +75,8 @@ Matriochka. Owned errors and context must be `Send + Sync + 'static`.
 pointer wide. Context and input-error updates retain that outer allocation, and
 wrapping an existing `Error` reuses its handle. The error chain and runtime
 data live behind the pointer. This does not mean one heap allocation in total:
-the original erased error, added context layers, and stored metadata can allocate
-their own storage. The runtime-context container is stored inline inside `Inner`.
+the error vector, original erased errors, added diagnostic context layers, and
+stored metadata can allocate their own storage. The runtime-context container is stored inline inside `Inner`.
 
 - `{error}` displays the outermost message.
 - `{error:#}` displays the complete chain on one line.
@@ -86,10 +88,18 @@ The chain contains explicitly added context and sources exposed by each error's
 calls or sources hidden by other wrappers. Input errors are separate metadata;
 they do not replace or appear in the diagnostic chain automatically.
 
-## Joining and flattening errors
+## Grouping errors
 
-`Join::new(errors)` groups errors; `Error::join(errors)` wraps the group in a
-one-pointer `Error`. Use `Error` elements when the errors have different types.
+`Error::join(errors)` stores wrapped errors directly in its internal vector of
+`Box<dyn StdError + Send + Sync>`. `Error::join` and `error.wrap(sub_error)` move
+child Matriochka runtime contexts into one aggregate context. All typed metadata
+is merged, including entries inserted through `data_mut()`. Existing values win
+when wrapping; the first value wins when joining. Duplicate values are dropped.
+Child errors keep their diagnostic messages and sources, with their runtime
+context removed. Ordinary errors need no Matriochka context of their own. Use `Error` elements when the errors have different types.
+
+Propagation reuses the current handle and its lazily initialized runtime context.
+Adding diagnostic messages does not initialize additional runtime contexts.
 
 ```rust
 use matriochka::Error;
@@ -103,22 +113,21 @@ let err = Error::join([
     ]),
 ]).context("RPC");
 
-let messages: Vec<_> = err.unwrap().map(ToString::to_string).collect();
-assert_eq!(messages, [
-    "RPC", "database", "connection lost", "invalid account", "invalid amount",
-]);
+assert!(err.downcast_ref::<io::Error>().is_some());
+assert_eq!(format!("{err:#}"),
+    "RPC: 2 errors [database: connection lost; 2 errors [invalid account; invalid amount]]");
 ```
 
-`Error::unwrap()` and `Join::unwrap()` return a borrowed `Unwrap` iterator.
-It traverses nested joins depth-first in insertion order, yielding context and
-source errors and omitting join containers. Duplicate errors remain. Empty joins
-yield nothing. `Unwrap::new(&error)` also works with ordinary standard errors.
+`Error::errors()` exposes the immediate boxed errors. Their merged metadata is
+available through the aggregate's `data()`, `data_mut()`, and input-error helpers.
+After adding a diagnostic context, that wrapper is the immediate error and the
+children remain beneath it. Diagnostic context messages continue to accumulate;
+they are separate from the consolidated runtime metadata.
 
-`Join::errors()` exposes the original children and their runtime metadata.
-Input-error lookup uses the current error's value first, then the first matching
-branch in depth-first order. Joining does not merge or overwrite child metadata.
-
-The standard `StdError::source()` API supports one source, so a `Join` has no standard
-source. `chain()` stops at the join and `root_cause()` returns the join itself;
-use `unwrap()` to visit all branches. Full diagnostic formatting includes every
+The standard `StdError::source()` API supports one source, so a native group with
+multiple children has no standard source. `chain()` stops at the group and
+`root_cause()` returns the group itself. Use `errors()` to inspect immediate
+children and `downcast_ref::<E>()` to search their errors and sources.
+A single-child native group displays transparently and exposes its linear source
+chain. Empty native groups display `0 errors`. Full diagnostic formatting includes every
 branch, and `downcast_ref::<E>()` can find concrete errors inside branches.
